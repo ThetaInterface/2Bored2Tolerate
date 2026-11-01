@@ -2,6 +2,7 @@
 const EventEmitter = require('events');
 const mc = require('minecraft-protocol');
 const Transport = require('./transport');
+const guardConnections = require('./connection-guard');
 const nbt = require('prismarine-nbt');
 const { DateTime } = require('luxon');
 const { version: APP_VERSION } = require('../package.json');
@@ -255,6 +256,7 @@ class ProxyManager extends EventEmitter {
     const conn = this.conn;
     this.conn = null; // Intentional shutdown must not schedule a reconnect.
     conn?.detach();
+    conn?.dispose();
     this._joiningPlayer = null;
     this.finishedQueue = false;
     this.notificationSent = false;
@@ -554,9 +556,12 @@ class ProxyManager extends EventEmitter {
       favicon: faviconBase64 ? `data:image/png;base64,${faviconBase64}` : undefined,
       registryCodec: {}, // Per-player configuration uses the captured upstream data below.
     });
+    guardConnections(this.server);
 
     this.server.on('login', (newProxyClient) => {
       this._log(`Player connecting: ${newProxyClient.username}`);
+      // Upstream owns the signed-chat acknowledgement window, not this server.
+      newProxyClient.removeAllListeners('message_acknowledgement');
       newProxyClient.removeAllListeners('login_acknowledged');
       newProxyClient.once('login_acknowledged', () => {
         newProxyClient.state = 'configuration';

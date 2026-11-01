@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
 const { test } = require('node:test');
+const net = require('node:net');
 const mc = require('minecraft-protocol');
 const data = require('minecraft-data')('1.21.4');
 const nbt = require('prismarine-nbt');
@@ -56,6 +57,10 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
     return client;
   }
   const first = await join();
+  // Local chat acknowledgements must not enter the server plugin's unrelated window.
+  const acknowledged = once(conn.player, 'message_acknowledgement');
+  first.write('message_acknowledgement', { count: 1 });
+  await acknowledged;
   assert.equal(manager.finishedQueue, false);
   assert.equal(manager.state.connected, true);
   const movement = once(remote, 'position');
@@ -76,8 +81,39 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
   const raw = mc.createSerializer({ state: 'play', isServer: true, version: '1.21.4' })
     .createPacketBuffer({ name: 'update_health', params: { health: 18, food: 19, foodSaturation: 3 } });
   conn.capture({}, { state: 'play', name: 'update_health' }, raw);
-  assert.match(conn.unavailable, /limit/);
-  assert.equal(conn.history.length, 0);
+  assert.equal(conn.unavailable, null);
+  const secondDisconnected = once(conn.player, 'end');
+  second.end();
+  await secondDisconnected;
+  await join();
+});
+
+test('game port rejects HTTP and malformed prefixes before decoding, still answers Minecraft status', { timeout: 10000 }, async (t) => {
+  Object.assign(config.proxy, { port: 0, bind: '127.0.0.1', onlineMode: false });
+  const manager = new ProxyManager();
+  manager._setupLocalServer();
+  t.after(() => manager.stop());
+  await once(manager.server, 'listening');
+  const port = manager.server.socketServer.address().port;
+  let accepted = 0;
+  manager.server.on('connection', () => accepted++);
+  for (const chunks of [[Buffer.from('G'), Buffer.from('ET / HTTP/1.1\r\nHost: localhost\r\n\r\n')],
+    [Buffer.from([0x16, 0x03, 0x01])], [Buffer.from([0xff, 0xff, 0xff, 0xff])]]) {
+    const socket = net.connect({ host: '127.0.0.1', port });
+    t.after(() => socket.destroy());
+    await once(socket, 'connect');
+    const closed = once(socket, 'close');
+    for (const chunk of chunks) {
+      socket.write(chunk);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    await closed;
+  }
+  assert.equal(accepted, 0);
+  const status = await new Promise((resolve, reject) => mc.ping({ host: '127.0.0.1', port, version: '1.21.4' },
+    (error, response) => error ? reject(error) : resolve(response)));
+  assert.equal(status.version.protocol, 769);
+  assert.equal(accepted, 1);
 });
 
 test('1.21.4 chunk, entity and equipment packets serialize without legacy shapes', () => {

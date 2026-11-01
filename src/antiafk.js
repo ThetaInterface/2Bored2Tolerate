@@ -23,6 +23,7 @@ class AntiAFK {
     };
     this.running = false;
     this.timers = new Map(); // actionName -> active timer ID
+    this.actionTimers = new Set();
     this.origin = null; // Set when start() is called
   }
 
@@ -83,6 +84,8 @@ class AntiAFK {
     this.running = false;
     this.timers.forEach((t) => clearTimeout(t));
     this.timers.clear();
+    for (const timer of this.actionTimers) clearTimeout(timer);
+    this.actionTimers.clear();
 
     try {
       this.bot?.setControlState('forward', false);
@@ -126,14 +129,14 @@ class AntiAFK {
         const pos = this.bot.entity.position;
         const dx = this.origin.x - pos.x;
         const dz = this.origin.z - pos.z;
-        const yaw = Math.atan2(-dx, dz); // mineflayer yaw convention
+        const yaw = Math.atan2(-dx, -dz); // mineflayer yaw convention
 
         this.bot.look(yaw, 0, true);
         this.bot.setControlState('forward', true);
 
         // Walk for a very short time to return
         const walkTime = Math.min(600, dist * 200);
-        setTimeout(() => {
+        this._afterAction(() => {
           try {
             this.bot?.setControlState('forward', false);
           } catch (e) { /* ignore */ }
@@ -151,7 +154,7 @@ class AntiAFK {
         // Very short walk time (200-500ms) to prevent drifting beyond 2 blocks
         const walkTime = 200 + Math.random() * 300;
 
-        setTimeout(() => {
+        this._afterAction(() => {
           try {
             this.bot?.setControlState(dir, false);
             // Check if we drifted too far and correct
@@ -168,18 +171,18 @@ class AntiAFK {
 
   /** Return to origin position */
   _returnToOrigin() {
-    if (!this.origin || !this.bot?.entity?.position) return;
+    if (!this.running || !this.origin || !this.bot?.entity?.position) return;
     try {
       const pos = this.bot.entity.position;
       const dx = this.origin.x - pos.x;
       const dz = this.origin.z - pos.z;
-      const yaw = Math.atan2(-dx, dz);
+      const yaw = Math.atan2(-dx, -dz);
       const dist = Math.sqrt(dx * dx + dz * dz);
 
       this.bot.look(yaw, 0, true);
       this.bot.setControlState('forward', true);
 
-      setTimeout(() => {
+      this._afterAction(() => {
         try {
           this.bot?.setControlState('forward', false);
         } catch (e) { /* ignore */ }
@@ -207,7 +210,7 @@ class AntiAFK {
     try {
       if (Math.random() > 0.4) {
         this.bot.setControlState('jump', true);
-        setTimeout(() => {
+        this._afterAction(() => {
           try {
             this.bot?.setControlState('jump', false);
           } catch (e) { /* ignore */ }
@@ -234,7 +237,7 @@ class AntiAFK {
     try {
       this.bot.setControlState('sneak', true);
       const sneakTime = 1000 + Math.random() * 3000;
-      setTimeout(() => {
+      this._afterAction(() => {
         try {
           this.bot?.setControlState('sneak', false);
         } catch (e) { /* ignore */ }
@@ -242,6 +245,15 @@ class AntiAFK {
     } catch (e) {
       logger.warn(`Anti-AFK sneak error: ${e.message}`);
     }
+  }
+
+  /** Cancel short actions as well as periodic actions on player handoff. */
+  _afterAction(action, delay) {
+    const timer = setTimeout(() => {
+      this.actionTimers.delete(timer);
+      if (this.running) action();
+    }, delay);
+    this.actionTimers.add(timer);
   }
 
   /** Get a random jitter to make timing less predictable */

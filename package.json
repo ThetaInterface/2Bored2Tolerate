@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node test/test.js && node --test test/protocol.js",
+    "test": "node test/test.js && node --test test/protocol.js test/transport-history.js test/antiafk.js",
     "learn": "node src/queuelearner.js"
   },
   "engines": {
@@ -31,9 +31,9 @@
     "everpolate": "^0.0.3",
     "express": "^4.21.1",
     "luxon": "^3.5.0",
-    "minecraft-data": "^3.69.0",
-    "minecraft-protocol": "^1.47.0",
-    "mineflayer": "^4.35.0",
+    "minecraft-data": "^3.117.0",
+    "minecraft-protocol": "^1.68.0",
+    "mineflayer": "^4.39.0",
     "node-notifier": "^10.0.1",
     "open": "^8.4.2",
     "socket.io": "^4.8.1",
