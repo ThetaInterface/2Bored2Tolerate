@@ -123,8 +123,12 @@ class Transport extends EventEmitter {
         }
       }
       if (['tags', 'enabled_features', 'custom_payload'].includes(meta.name)) {
+        // Channel plugins replace packet.data with parsed values after capture.
+        // Keep an independent Buffer for configuration replay, not a Uint8Array.
+        const snapshot = meta.name === 'custom_payload'
+          ? { ...data, data: Buffer.from(data.data) } : data;
         this.configuration.set(meta.name === 'custom_payload' ? data.channel : meta.name,
-          { name: meta.name, data });
+          { name: meta.name, data: snapshot });
       }
       return;
     }

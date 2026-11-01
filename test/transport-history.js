@@ -3,6 +3,7 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const { test } = require('node:test');
 const Transport = require('../src/transport');
+const mc = require('minecraft-protocol');
 
 function fixture(t) {
   // Exercise transport independently of authentication and mineflayer plugins.
@@ -194,6 +195,28 @@ test('disk write failure ends pending replay, cleans storage, and permits fresh 
   capture('login', Buffer.from('fresh-login'));
   capture('position', Buffer.from('position'));
   assert.equal(transport.unavailable, null);
+});
+
+test('configuration payload survives plugin mutation and serializes on repeated 1.21.4 joins', t => {
+  const { transport } = fixture(t);
+  const original = Buffer.from([7, ...Buffer.from('vanilla')]);
+  const packet = { channel: 'minecraft:brand', data: Buffer.from(original) };
+  transport.capture(packet, { state: 'configuration', name: 'custom_payload' }, Buffer.alloc(0));
+  packet.data.fill(0);
+  packet.data = 'vanilla'; // minecraft-protocol channel parsers replace this field.
+  const saved = transport.configuration.get('minecraft:brand');
+  assert.notEqual(saved.data, packet);
+  assert(Buffer.isBuffer(saved.data.data));
+  assert.deepEqual(saved.data.data, original);
+  const serializer = mc.createSerializer({ state: 'configuration', isServer: true, version: '1.21.4' });
+  const parser = mc.createDeserializer({ state: 'configuration', isServer: false, version: '1.21.4' });
+  for (let join = 0; join < 2; join++) {
+    const raw = serializer.createPacketBuffer({ name: saved.name, params: saved.data });
+    const decoded = parser.parsePacketBuffer(raw).data;
+    assert.equal(decoded.name, 'custom_payload');
+    assert.equal(decoded.params.channel, 'minecraft:brand');
+    assert.deepEqual(decoded.params.data, original);
+  }
 });
 
 test('control reset precedes handoff; configuration retains only active resource packs', async t => {
