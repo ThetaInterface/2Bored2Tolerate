@@ -377,7 +377,7 @@ async function testWebServer() {
   await asyncTest('CSS file is served', async () => {
     const res = await request('/css/style.css');
     assertEqual(res.status, 200);
-    assert(res.body.includes('--bg-dark'), 'Should contain CSS variables');
+    assert(res.body.includes('--bg:'), 'Should contain CSS variables');
   });
 
   await asyncTest('JS file is served', async () => {

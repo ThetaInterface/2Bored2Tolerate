@@ -94,9 +94,11 @@ See `.env.example` for all options.
 3. **Open the dashboard**: Navigate to `http://localhost:8080` (if `WEB_PASSWORD` is set, you'll see a login screen)
 4. **Click "Start Queue"** to begin queueing
 5. **Wait** — the dashboard shows real-time position and ETA
-6. **Connect in Minecraft** to `localhost:25565` when the queue is near the front
+6. **Connect in Minecraft 1.21.4** to `localhost:25565` after the upstream login completes, including while waiting in queue. You see the queue server directly; disconnecting Minecraft leaves the upstream queue connection running.
 7. **Anti-AFK**: If enabled, the bot will automatically prevent kicks until you connect (stays within 2 blocks of its position)
-8. **Click "Stop Queue"** after you're done playing
+8. **Click "Stop Queue"** after you're done playing. Stopping the queue also disconnects a player who is waiting for the queue.
+
+The 1.21.4 transport uses captured upstream registries and a bounded packet replay, not the legacy mcproxy packet generator. Late joins replay up to 64 MiB of world history. If that limit is exceeded, new joins are rejected without interrupting the upstream session or an already connected player. A server configuration/registry change disconnects the local player with a reconnect message while the bot completes the transfer. Joining before upstream login is ready also requires retrying. This is not an unlimited-duration world snapshot. Local protocol tests do not establish live 2b2t or vanilla-client compatibility.
 
 ## Anti-AFK
 

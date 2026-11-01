@@ -1,6 +1,6 @@
 // src/config.js - Configuration loaded from .env
 const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '..', '.env'), override: true });
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 /** Parse an integer from a string, returning the fallback if NaN */
 const intOr = (str, fallback) => { const n = parseInt(str, 10); return Number.isNaN(n) ? fallback : n; };

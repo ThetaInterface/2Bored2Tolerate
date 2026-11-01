@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node test/test.js",
+    "test": "node test/test.js && node --test test/protocol.js",
     "learn": "node src/queuelearner.js"
   },
   "engines": {

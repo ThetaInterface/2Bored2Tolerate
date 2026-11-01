@@ -1,7 +1,7 @@
 // src/proxy.js - Core Minecraft proxy and queue management
 const EventEmitter = require('events');
 const mc = require('minecraft-protocol');
-const mcproxy = require('@rob9315/mcproxy');
+const Transport = require('./transport');
 const nbt = require('prismarine-nbt');
 const { DateTime } = require('luxon');
 const { version: APP_VERSION } = require('../package.json');
@@ -27,17 +27,6 @@ class ProxyManager extends EventEmitter {
     this.server = null;
     this.proxyClient = null;
     this.antiAfk = null;
-
-    // Real registry_data entries captured from 2b2t during the bot's own
-    // CONFIGURATION handshake, keyed by registry id (e.g.
-    // 'minecraft:enchantment'). minecraft-data's bundled snapshot is known
-    // broken/incomplete for several registries (enchantment in particular -
-    // both unparseable AND, even when patched around, missing the specific
-    // numeric indices real entities' equipped items reference, which crashes
-    // clients trying to decode other players'/mobs' gear). The real data
-    // from 2b2t is guaranteed format- and index-correct; prefer it over our
-    // curated/patched fallback wherever available (see _setupLocalServer).
-    this._realRegistryData = {};
 
     // Queue tracking
     this.finishedQueue = false;
@@ -187,29 +176,13 @@ class ProxyManager extends EventEmitter {
     }
 
     try {
-      this.conn = new mcproxy.Conn(options);
+      this.conn = new Transport(options);
       this.client = this.conn.client || this.conn.bot._client;
     } catch (err) {
       this._log(`Failed to create proxy connection: ${err.message}`, 'error');
       this._updateState({ doing: 'idle', isInQueue: false });
       return;
     }
-
-    // Band-aid until we have the real enchantment registry from 2b2t's own
-    // handshake (captured into _realRegistryData and preferred in
-    // _setupLocalServer once available): decoding any equipped item with an
-    // enchantment crashes the client without it. Drop equipment updates
-    // relayed from the real server here; the matching gap in mcproxy's own
-    // initial-join packet construction is patched directly in
-    // node_modules/@rob9315/mcproxy/lib/packets.js (entity_equipment is
-    // skipped entirely there too). Note: the wire/vanilla packet name is
-    // "set_equipment", but minecraft-data/minecraft-protocol's internal name
-    // for it is "entity_equipment".
-    this.conn.toClientDefaultMiddleware = [
-      (packetData) => {
-        if (packetData.meta?.name === 'entity_equipment') return false;
-      },
-    ];
 
     // Attach error listener immediately to catch async auth/connection errors
     this.client.on('error', (err) => {
@@ -279,6 +252,10 @@ class ProxyManager extends EventEmitter {
 
   /** Internal: clean up all connections and timers */
   _cleanup() {
+    const conn = this.conn;
+    this.conn = null; // Intentional shutdown must not schedule a reconnect.
+    conn?.detach();
+    this._joiningPlayer = null;
     this.finishedQueue = false;
     this.notificationSent = false;
     this.queueStartPlace = null;
@@ -328,14 +305,6 @@ class ProxyManager extends EventEmitter {
     });
 
     this.client.on('packet', (data, meta) => {
-      // Capture 2b2t's real registry_data during the bot's own CONFIGURATION
-      // handshake - this is the actual, correct data (right format, right
-      // indices) as opposed to our curated/patched fallback. See comment on
-      // _realRegistryData in the constructor.
-      if (meta.name === 'registry_data' && meta.state === 'configuration' && data?.id) {
-        this._realRegistryData[data.id] = data;
-      }
-
       // Fallback queue completion: server transfer sends a play-state login packet.
       // Guard with queueStartPlace so we don't fire on the initial queue server join.
       if (meta.name === 'login' && !this.finishedQueue && this.queueStartPlace !== null) {
@@ -521,6 +490,7 @@ class ProxyManager extends EventEmitter {
 
   /** Internal: handle queue completion */
   _handleQueueFinished() {
+    if (this.finishedQueue) return;
     this._log('Queue finished! Connected to server.');
 
     // Record this session so ETA estimates improve over time
@@ -542,7 +512,7 @@ class ProxyManager extends EventEmitter {
       queuePlace: 'DONE',
       eta: 'NOW',
       doing: 'connected',
-      connected: true,
+      connected: Boolean(this.proxyClient),
     });
 
     // Track player health/food updates
@@ -573,52 +543,6 @@ class ProxyManager extends EventEmitter {
       }
     }
 
-    // mc-protocol's default registryCodec fallback (minecraft-data's bundled
-    // dimensionCodec snapshot) is stale/incomplete for several registries
-    // (e.g. enchantment, most of worldgen/biome) and crashes real 1.21.4
-    // clients with "Failed to load registries" parse errors. Most registries
-    // are fine left empty/absent (the client falls back to its own built-in
-    // defaults), but vanilla hard-requires dimension_type, painting_variant,
-    // and wolf_variant to be non-empty - and wolf_variant's spawn-biome
-    // conditions in turn reference specific named biomes that must exist in
-    // worldgen/biome. Sending just those (verified not part of the broken
-    // set) from the bundled snapshot satisfies all of that without
-    // resurrecting the parse-error registries/biomes.
-    const mcData = require('minecraft-data')(config.mc.version);
-    const dimensionCodec = mcData.loginPacket?.dimensionCodec || {};
-    const registryCodec = {};
-    for (const key of ['minecraft:dimension_type', 'minecraft:painting_variant', 'minecraft:wolf_variant', 'minecraft:damage_type']) {
-      if (dimensionCodec[key]) registryCodec[key] = dimensionCodec[key];
-    }
-    const biomeRegistry = dimensionCodec['minecraft:worldgen/biome'];
-    if (biomeRegistry) {
-      // Send the full biome set, not just whichever ones the world happens to
-      // reference - vanilla world init hard-requires specific biomes to
-      // exist (plains, etc.) depending on spawn/dimension, so cherry-picking
-      // a handful just shifts which "Missing element" shows up next.
-      registryCodec['minecraft:worldgen/biome'] = {
-        id: 'minecraft:worldgen/biome',
-        // The bundled snapshot's effects.music sub-field uses an outdated
-        // sound-reference shape and fails to parse on real 1.21.4 clients;
-        // strip it (cosmetic-only - biomes without it parse fine).
-        entries: biomeRegistry.entries.map((e) => {
-          const clone = JSON.parse(JSON.stringify(e));
-          const effects = clone.value?.value?.effects?.value;
-          if (effects) delete effects.music;
-          return clone;
-        }),
-      };
-    }
-
-    // Prefer the real data captured from 2b2t's own CONFIGURATION handshake
-    // (see _realRegistryData) over the curated/patched fallback above,
-    // wherever we have it - it's guaranteed correct, including the specific
-    // numeric indices needed to decode other entities' equipped item
-    // enchantments (which our curated enchantment-less fallback can't).
-    for (const [id, entry] of Object.entries(this._realRegistryData)) {
-      registryCodec[id] = entry;
-    }
-
     this.server = mc.createServer({
       'online-mode': config.proxy.onlineMode,
       encryption: true,
@@ -628,105 +552,46 @@ class ProxyManager extends EventEmitter {
       'max-players': 1,
       motd: 'Waiting in queue...',
       favicon: faviconBase64 ? `data:image/png;base64,${faviconBase64}` : undefined,
-      registryCodec,
+      registryCodec: {}, // Per-player configuration uses the captured upstream data below.
     });
 
-    // MC 1.21.4 login/configuration flow:
-    //   1. Server sends login_success → 'login' event fires (client state: LOGIN)
-    //   2. Client receives login_success, transitions client-side to CONFIGURATION,
-    //      sends login_acknowledged
-    //   3. mc-protocol's onClientLoginAck: state → CONFIGURATION, sends registry_data,
-    //      finish_configuration → client acks → state → PLAY, emits 'playerJoin'
-    //
-    // Problem: mc-protocol's built-in registry_data is incomplete/incompatible with
-    // MC 1.21.4 (missing tags, wrong biome/enchantment formats) → client crashes
-    // with "Failed to load registries". And calling end() in LOGIN state sends
-    // packet 0x00 which the already-CONFIGURATION client decodes as cookie_request.
-    //
-    // Solution for kicks: intercept login_acknowledged BEFORE mc-protocol's handler,
-    // manually transition to CONFIGURATION state, and send a proper CONFIGURATION
-    // disconnect (packet 0x02 / anonymousNbt reason). No registry data is ever sent.
     this.server.on('login', (newProxyClient) => {
       this._log(`Player connecting: ${newProxyClient.username}`);
-
-      // Determine if this player should be kicked
-      let kickReason = null;
-
-      if (!this.finishedQueue) {
-        const pos = this.state.queuePlace !== 'None' ? `#${this.state.queuePlace}` : '?';
-        const eta = this.state.eta !== 'None' ? this.state.eta : '?';
-        kickReason =
-          `§cStill waiting in the 2b2t queue!\n\n` +
-          `§7Position: §e${pos}\n` +
-          `§7ETA: §e${eta}\n\n` +
-          `§7Connect again after the queue finishes.`;
-      } else if (config.proxy.whitelist && this.client && this.client.uuid !== newProxyClient.uuid) {
-        kickReason = 'Not whitelisted! Use the same account as the proxy.';
-      }
-
-      if (kickReason) {
-        // Remove mc-protocol's login_acknowledged handler so it never sends
-        // broken registry_data or finish_configuration.
-        newProxyClient.removeAllListeners('login_acknowledged');
-
-        // When the client transitions to CONFIGURATION, send a proper disconnect.
-        newProxyClient.once('login_acknowledged', () => {
-          try {
-            // Swap server-side serializer to CONFIGURATION (creates new
-            // Serializer + FullPacketParser for config-state packets).
-            newProxyClient.state = 'configuration';
-
-            // CONFIGURATION disconnect is packet 0x02 with anonymousNbt reason.
-            const reason = nbt.comp({ text: nbt.string(kickReason) });
-            newProxyClient.write('disconnect', { reason });
-          } catch (err) {
-            this._log(`Error sending config disconnect: ${err.message}`, 'error');
-          }
-          // Close the underlying socket (original Client.end before server.js override).
-          newProxyClient._end(kickReason);
-        });
-
-        this._log(`${newProxyClient.username} will be kicked in CONFIGURATION state`);
-        return;
-      }
-
-      // Allowed player — mc-protocol's login_acknowledged handler sends
-      // registry_data from the curated registryCodec built in
-      // _setupLocalServer (dimension_type/painting_variant/wolf_variant/a
-      // handful of biomes - see comments there) and then finish_configuration.
-      //
-      // wolf_variant's spawn conditions also reference biome tags
-      // (is_badlands/is_jungle/is_savanna) that aren't bound by any
-      // registry_data entry - tags are a separate 'tags' packet that
-      // mc-protocol's default flow never sends at all. Inject one (with
-      // empty membership - just needs to exist) before finish_configuration.
-      newProxyClient.prependOnceListener('login_acknowledged', () => {
-        try {
-          // We run before mc-protocol's own login_acknowledged handler (which
-          // normally sets this), so the serializer is still LOGIN-state
-          // unless we flip it ourselves first - otherwise this write gets
-          // serialized with the wrong protocol definition and corrupts the
-          // stream (manifests downstream as garbled/truncated packets).
-          newProxyClient.state = 'configuration';
-          newProxyClient.write('tags', {
-            tags: [
-              {
-                tagType: 'minecraft:worldgen/biome',
-                tags: [
-                  { tagName: 'minecraft:is_badlands', entries: [] },
-                  { tagName: 'minecraft:is_jungle', entries: [] },
-                  { tagName: 'minecraft:is_savanna', entries: [] },
-                ],
-              },
-            ],
-          });
-        } catch (err) {
-          this._log(`Error sending tags packet: ${err.message}`, 'error');
+      newProxyClient.removeAllListeners('login_acknowledged');
+      newProxyClient.once('login_acknowledged', () => {
+        newProxyClient.state = 'configuration';
+        const conn = this.conn;
+        const reason = config.proxy.whitelist && this.client?.uuid !== newProxyClient.uuid
+          ? 'Not whitelisted! Use the same account as the proxy.'
+          : this._joiningPlayer || this.proxyClient ? 'A player is already connected.'
+            : !conn ? 'Upstream is disconnected.' : conn.unavailable;
+        if (reason) {
+          newProxyClient.write('disconnect', { reason: nbt.comp({ text: nbt.string(reason) }) });
+          newProxyClient._end(reason);
+          return;
         }
+        this._joiningPlayer = newProxyClient;
+        const timeout = setTimeout(() => newProxyClient.end('Configuration timed out.'), 30000);
+        newProxyClient.once('end', () => {
+          clearTimeout(timeout);
+          if (this._joiningPlayer === newProxyClient) this._joiningPlayer = null;
+        });
+        for (const registry of Object.values(conn.registries)) newProxyClient.write('registry_data', registry);
+        for (const { name, data } of conn.configuration.values()) newProxyClient.write(name, data);
+        newProxyClient.once('finish_configuration', () => {
+          clearTimeout(timeout);
+          if (this._joiningPlayer === newProxyClient) this._joiningPlayer = null;
+          newProxyClient.state = 'play';
+          // A transfer during configuration invalidates this client's registry IDs.
+          if (this.conn !== conn || conn.registries !== registries) {
+            newProxyClient.end('Upstream changed during login. Please reconnect.');
+            return;
+          }
+          this.server.emit('playerJoin', newProxyClient);
+        });
+        const registries = conn.registries;
+        newProxyClient.write('finish_configuration', {});
       });
-      // mc-protocol's own login_acknowledged handler (registered earlier in
-      // login.js) runs next and proceeds with its configuration handshake,
-      // eventually emitting 'playerJoin'.
     });
 
     // 'playerJoin' fires after the full LOGIN → CONFIGURATION → PLAY handshake.
@@ -734,43 +599,45 @@ class ProxyManager extends EventEmitter {
     this.server.on('playerJoin', (newProxyClient) => {
       this._log(`Player entered play state: ${newProxyClient.username}`);
 
-      // Forward player packets to server
-      newProxyClient.on('packet', (_, meta, rawData) => {
-        this._filterAndSend(rawData, meta, this.client);
-      });
-
       newProxyClient.on('end', () => {
         this._log('Player disconnected');
+        if (this.proxyClient !== newProxyClient) return;
         this.proxyClient = null;
+        this.conn?.detach();
         this._updateState({ connected: false });
         this._tryStartAntiAfk();
       });
 
-      // Stop anti-AFK when player connects
-      if (this.antiAfk) {
-        this.antiAfk.stop();
-        this._updateState({ antiAfkActive: false });
-      }
-
-      // Send cached packets and link
-      try {
-        this.conn.sendPackets(newProxyClient);
-        this.conn.link(newProxyClient);
-        this.proxyClient = newProxyClient;
-
-        this._updateState({
-          connected: true,
-          username: newProxyClient.username,
-        });
-      } catch (err) {
-        this._log(`Failed to link player: ${err.message}`, 'error');
-        newProxyClient.end('Failed to link connection.');
-      }
+      this._linkPlayer(newProxyClient);
     });
 
     this.server.on('error', (err) => {
       this._log(`Local server error: ${err.message}`, 'error');
     });
+  }
+
+  /** Attach during queue or gameplay without restarting the upstream session. */
+  _linkPlayer(player) {
+    if (!player || this.proxyClient === player || !this.conn) return;
+
+    try {
+      this.conn.attach(player);
+      this.proxyClient = player;
+
+      this._updateState({
+        connected: true,
+        username: player.username,
+      });
+
+      if (this.antiAfk) {
+        this.antiAfk.stop();
+        this._updateState({ antiAfkActive: false });
+      }
+      this._log(`Linked player ${player.username} to 2b2t`);
+    } catch (err) {
+      this._log(`Failed to link player: ${err.message}`, 'error');
+      player.end('Failed to link connection.');
+    }
   }
 
   /** Internal: attempt to start anti-AFK (only when bot is on server and no player is connected) */
@@ -819,18 +686,6 @@ class ProxyManager extends EventEmitter {
         }
       }
     );
-  }
-
-  /** Internal: filter and send packets (skip keep_alive/update_time to avoid double-response) */
-  _filterAndSend(data, meta, dest) {
-    if (!dest) return;
-    if (meta.name !== 'keep_alive' && meta.name !== 'update_time') {
-      try {
-        dest.writeRaw(data);
-      } catch (e) {
-        // Connection may have closed
-      }
-    }
   }
 
   /** Check for cached Microsoft auth tokens and log status */
