@@ -25,6 +25,12 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
   });
   await once(upstream, 'listening');
   let remote;
+  const equipment = { entityId: 3, equipments: [0, 1, 2, 5].map(slot => ({ slot,
+    item: { itemCount: 1, itemId: data.itemsByName.diamond_sword.id,
+      addedComponentCount: 2, removedComponentCount: 0,
+      components: [{ type: 'damage', data: 7 },
+        { type: 'custom_name', data: { type: 'compound', value: { text: nbt.string('Proxy test sword') } } }],
+      removeComponents: [] } })) };
   upstream.on('playerJoin', (client) => {
     remote = client;
     client.write('login', data.loginPacket);
@@ -32,6 +38,7 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
       dx: 0, dy: 0, dz: 0, yaw: 0, pitch: 0, flags: 0 });
     client.write('window_items', { windowId: 0, stateId: 2,
       items: Array.from({ length: 46 }, () => ({ itemCount: 0 })), carriedItem: { itemCount: 0 } });
+    client.write('entity_equipment', equipment);
     client.write('playerlist_header', { header: nbt.comp({ text: nbt.string('Position in queue: 42') }),
       footer: nbt.comp({ text: nbt.string('Queue') }) });
   });
@@ -53,7 +60,8 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
     assert(packets.some(p => p.name === 'registry_data'));
     assert.equal(packets.find(p => p.name === 'login').packet.worldState.dimension, 0);
     assert.equal(packets.find(p => p.name === 'window_items').packet.items.length, 46);
-    assert(packets.some(p => p.name === 'playerlist_header'));
+     assert(packets.some(p => p.name === 'playerlist_header'));
+    assert.deepEqual(packets.find(p => p.name === 'entity_equipment').packet, equipment);
     return client;
   }
   const first = await join();
@@ -73,6 +81,9 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
   assert.equal(conn.player, null);
   assert.equal(manager.state.connected, false);
   const second = await join();
+  const equipmentUpdate = once(second, 'entity_equipment');
+  remote.write('entity_equipment', equipment);
+  assert.deepEqual((await equipmentUpdate)[0], equipment);
   assert.equal(conn.bot.entity.position.x, 12);
   const live = once(second, 'update_health');
   remote.write('update_health', { health: 18, food: 19, foodSaturation: 3 });
@@ -85,6 +96,24 @@ test('1.21.4 local upstream, queue join, forwarding, disconnect and rejoin', { t
   const secondDisconnected = once(conn.player, 'end');
   second.end();
   await secondDisconnected;
+  await join();
+  // Reproduce the socket failure without writing an Error-valued kick packet.
+  const failedPlayer = conn.player;
+  const failedEnd = new Promise(resolve => failedPlayer.once('end', resolve));
+  let kicks = 0;
+  const write = failedPlayer.write.bind(failedPlayer);
+  failedPlayer.write = (name, packet) => {
+    if (name === 'kick_disconnect') kicks++;
+    return write(name, packet);
+  };
+  failedPlayer.socket.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+  failedPlayer.emit('error', new Error('Secondary stream failure'));
+  await failedEnd;
+  assert.equal(kicks, 0);
+  assert.equal(conn.player, null);
+  assert.equal(conn.replay, null);
+  assert.equal(conn.client.state, 'play');
+  assert.equal(manager.state.connected, false);
   await join();
 });
 

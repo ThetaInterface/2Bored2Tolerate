@@ -8,7 +8,7 @@ const mc = require('minecraft-protocol');
 function fixture(t) {
   // Exercise transport independently of authentication and mineflayer plugins.
   const transport = Object.create(Transport.prototype);
-  transport.client = { state: 'play' };
+  transport.client = { state: 'play', version: '1.21.4' };
   transport.maxBytes = 32;
   transport.registries = { test: {} };
   transport.configuration = new Map();
@@ -36,6 +36,64 @@ function player() {
 }
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
+test('multi-slot equipment is rebuilt after destructive decoding for replay and live forwarding', async t => {
+  const { transport } = fixture(t);
+  const serializer = mc.createSerializer({ state: 'play', isServer: true, version: '1.21.4' });
+  const parser = mc.createDeserializer({ state: 'play', isServer: false, version: '1.21.4' });
+  const item = { itemCount: 1, itemId: 1, addedComponentCount: 1, removedComponentCount: 0,
+    components: [{ type: 'damage', data: 7 }], removeComponents: [] };
+  const packet = { entityId: 3, equipments: [{ slot: 0, item }, { slot: 1, item },
+    { slot: 2, item: { itemCount: 0 } }, { slot: 5, item }] };
+  const original = serializer.createPacketBuffer({ name: 'entity_equipment', params: packet });
+  const decoded = parser.parsePacketBuffer(Buffer.from(original));
+  assert.equal(decoded.data.params.equipments.length, 4);
+  // Reproduce the old bug: the emitted raw buffer now terminates after slot zero.
+  assert(parser.parsePacketBuffer(Buffer.from(decoded.buffer)).metadata.size < original.length);
+  transport.capture(decoded.data.params, { state: 'play', name: 'entity_equipment' }, decoded.buffer);
+  const local = player();
+  transport.attach(local);
+  await replayed(transport);
+  assert.deepEqual(local.packets.at(-1), original);
+  const live = parser.parsePacketBuffer(Buffer.from(original));
+  transport.capture(live.data.params, { state: 'play', name: 'entity_equipment' }, live.buffer);
+  assert.deepEqual(local.packets.at(-1), original);
+  const received = parser.parsePacketBuffer(Buffer.from(local.packets.at(-1)));
+  assert.equal(received.metadata.size, original.length);
+  assert.deepEqual(received.data.params, packet);
+});
+
+test('signed chat precedes dependent messages in late-join history', async t => {
+  const { transport, capture } = fixture(t);
+  capture('player_chat', Buffer.from('signed-chat'));
+  capture('hide_message', Buffer.from('signature-reference'));
+  capture('system_chat', Buffer.from('transient-chat'));
+  const local = player();
+  transport.attach(local);
+  await replayed(transport);
+  assert.deepEqual(local.packets.map(raw => raw.toString()), ['login', 'signed-chat', 'signature-reference']);
+});
+
+test('closed local socket stops replay and live writes without losing upstream history', async t => {
+  const { transport, capture } = fixture(t);
+  const local = player();
+  local.socket = { destroyed: false };
+  transport.attach(local);
+  local.socket.destroyed = true;
+  await tick();
+  assert.equal(transport.replay, null);
+  assert.equal(transport.player, null);
+  assert.equal(local.packets.length, 0);
+  const second = player();
+  transport.attach(second);
+  await replayed(transport);
+  const count = second.packets.length;
+  second.socket = { writableEnded: true };
+  capture('block_change', Buffer.from('after-close'));
+  assert.equal(second.packets.length, count);
+  assert.equal(transport.player, null);
+  assert.equal(transport.unavailable, null);
+});
+
 async function replayed(transport) {
   for (let i = 0; i < 1000 && transport.replay; i++) await tick();
   assert.equal(transport.replay, null);

@@ -555,6 +555,17 @@ class ProxyManager extends EventEmitter {
       motd: 'Waiting in queue...',
       favicon: faviconBase64 ? `data:image/png;base64,${faviconBase64}` : undefined,
       registryCodec: {}, // Per-player configuration uses the captured upstream data below.
+      errorHandler: (client, error) => {
+        if (client._proxyFailed) return;
+        client._proxyFailed = true;
+        const reason = String(error?.message || error || 'Local connection failed');
+        this._log(`Local player connection failed (${error?.code || 'protocol'}): ${reason}`, 'warn');
+        if (this.conn?.player === client) this.conn.detach();
+        // The socket or serializer has failed. Do not serialize a kick onto it;
+        // the default handler passes Error to an NBT string and fails recursively.
+        client._endReason = reason;
+        client.socket.destroy();
+      },
     });
     guardConnections(this.server);
 

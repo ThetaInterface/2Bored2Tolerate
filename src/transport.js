@@ -6,9 +6,10 @@ const path = require('node:path');
 const mc = require('minecraft-protocol');
 const mineflayer = require('mineflayer');
 
+// Signed player_chat must replay: later chat/hide_message packets reference its signatures.
 const TRANSIENT = new Set([
   'keep_alive', 'ping', 'kick_disconnect', 'position', 'update_time',
-  'system_chat', 'player_chat', 'profileless_chat', 'sound_effect',
+  'system_chat', 'profileless_chat', 'sound_effect',
   'named_sound_effect', 'world_particles', 'entity_sound_effect',
 ]);
 // These responses belong to the upstream protocol client, not the local player.
@@ -133,6 +134,12 @@ class Transport extends EventEmitter {
       return;
     }
     if (meta.state !== 'play') return;
+    if (meta.name === 'entity_equipment') {
+      // The protocol decoder clears continuation bits in the input Buffer.
+      // Rebuild before journaling/live forwarding, while items are still unmodified.
+      this.equipmentSerializer ||= mc.createSerializer({ state: 'play', isServer: true, version: this.client.version });
+      raw = this.equipmentSerializer.createPacketBuffer({ name: meta.name, params: data });
+    }
     if (meta.name === 'start_configuration') {
       // Registry indices can change. Never replay an old world with new registries.
       this.player?.end('Server is reconfiguring. Rejoin once the transfer completes.');
@@ -149,6 +156,9 @@ class Transport extends EventEmitter {
     if (meta.name === 'position') this.position = structuredClone(data);
     if (meta.name === 'update_time') this.time = Buffer.from(raw);
     if (!TRANSIENT.has(meta.name)) this.appendHistory(raw);
+    if (this.player && (this.player.ended || this.player.socket?.destroyed || this.player.socket?.writableEnded)) {
+      this.detach();
+    }
     if (this.player && !this.replay && !['keep_alive', 'ping'].includes(meta.name)) {
       this.player.writeRaw(raw);
       const stream = this.player.compressor || this.player.framer;
@@ -213,6 +223,10 @@ class Transport extends EventEmitter {
     const replay = this.replay;
     if (!replay) return;
     const player = this.player;
+    if (player.ended || player.socket?.destroyed || player.socket?.writableEnded) {
+      this.detach();
+      return;
+    }
     try {
       if (!replay.stream.writable || player.state !== 'play') throw new Error('Local connection closed');
       const waitForDrain = () => {
